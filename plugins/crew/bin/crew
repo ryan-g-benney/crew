@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""crew: the deterministic half of the crew harness. Branch -> feature state, gates, locks, agent briefs,
+LLM-free checks, wave merges and both hooks. State lives in <main repo>/.crew/ and is never committed."""
+import argparse, datetime, fnmatch, json, os, re, subprocess, sys, uuid
+from pathlib import Path
+
+TICKET = re.compile(r"[A-Z][A-Z0-9]+-\d+")
+GATES = {"slice": "scope", "harness": "design", "freeze": "build", "wave": "build", "merge": "done"}
+SKILL = {**{p: p for p in ("start", "scope", "design", "build", "verify")}, "done": "status"}
+DEPS = {"pyproject.toml", "requirements.txt", "uv.lock", "poetry.lock", "package.json", "package-lock.json",
+        "pnpm-lock.yaml", "yarn.lock", "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "Gemfile.lock"}
+TEST_FN = re.compile(r"^\s*(?:async\s+)?def test_|^\s*(?:it|test)\(", re.M)
+
+def die(msg): sys.exit(f"crew: {msg}")
+def today(): return datetime.date.today().isoformat()
+def read(p): return p.read_text() if p.exists() else ""
+def dump(o): return json.dumps(o, indent=2) + "\n"
+def fdir(root, name): return root / ".crew" / "features" / name
+def save(root, st): (fdir(root, st["feature"]) / "state.json").write_text(dump(st))
+def meta(root): return json.loads(read(root / ".crew/atlas/meta.json") or "{}")
+def features(root): return [json.loads(p.read_text()) for p in sorted(root.glob(".crew/features/*/state.json"))]
+def icrs(root, st): return [json.loads(x) for x in read(fdir(root, st["feature"]) / "icrs.jsonl").splitlines() if x]
+def hit(path, globs): return any(fnmatch.fnmatch(path, g) or g.endswith("/") and path.startswith(g) for g in globs)
+def branch(cwd="."): return git("branch", "--show-current", cwd=cwd, check=False) or ""
+
+def git(*args, cwd=".", check=True):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode:
+        return die(r.stderr.strip() or f"git {args[0]} failed") if check else None
+    return r.stdout.strip()
+
+def repo_root(cwd="."):
+    """Main checkout root: the same from every worktree of the repo."""
+    d = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=cwd, check=False)
+    return d and (Path(d).parent if Path(d).name == ".git" else Path(d))
+
+def val(v):
+    try: return json.loads(v)
+    except ValueError: return v
+
+def link(root, st, br):
+    if br not in st["branches"]:
+        st["branches"].append(br)
+        save(root, st)
+    return st
+
+def find(root, br):
+    """Branch -> feature: exact branch match, else a ticket key in the branch name (which links the branch)."""
+    fs, key = features(root), TICKET.search(br)
+    st = next((s for s in fs if br in s["branches"]), None)
+    if not st and key and (st := next((s for s in fs if s.get("ticket") == key[0]), None)):
+        link(root, st, br)
+    return st
+
+def ctx(a):
+    """(main root, current checkout, feature state); -f overrides branch discovery."""
+    root = repo_root() or die("not in a git repo")
+    if a.feature:
+        st = json.loads(read(fdir(root, a.feature) / "state.json") or "null") or die(f"no feature '{a.feature}'")
+    else:
+        st = find(root, branch()) or die(f"no crew feature for branch '{branch()}' (crew start NAME)")
+    return root, Path(git("rev-parse", "--show-toplevel")), st
+
+def local_settings(top):
+    """Builder worktrees must branch from the feature branch, not main."""
+    p = Path(top) / ".claude/settings.local.json"
+    s = json.loads(read(p) or "{}")
+    if s.setdefault("worktree", {}).get("baseRef") != "head":
+        s["worktree"]["baseRef"] = "head"
+        p.parent.mkdir(exist_ok=True)
+        p.write_text(dump(s))
+
+def init(root):
+    (root / ".crew/features").mkdir(parents=True, exist_ok=True)
+    (root / ".crew/atlas").mkdir(exist_ok=True)
+    ex = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=root)) / "info/exclude"
+    ex.parent.mkdir(exist_ok=True)
+    have = read(ex).splitlines()
+    if add := [x for x in (".crew/", ".claude/settings.local.json") if x not in have]:
+        ex.write_text("\n".join(have + add) + "\n")
+    local_settings(root)
+
+def new_feature(root, name, intent=None, ticket=None, br=None, worktree=False):
+    init(root)
+    name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or die("empty feature name")
+    if fdir(root, name).exists(): die(f"feature '{name}' already exists")
+    br = br or (f"feat/{name}" if worktree else branch()) or die("detached HEAD: pass --branch")
+    wt = root.parent / f"{root.name}.worktrees" / name if worktree else None
+    if wt:
+        new = git("rev-parse", "--verify", "--quiet", br, cwd=root, check=False) is None
+        git("worktree", "add", *(["-b", br, str(wt)] if new else [str(wt), br]), cwd=root)
+        local_settings(wt)
+    ticket = ticket or (TICKET.search(br) or [None])[0]
+    fdir(root, name).mkdir(parents=True)
+    st = dict(feature=name, ticket=ticket, branches=[br], worktree=wt and str(wt), phase="start", wave=0,
+              gates={}, locked={}, owners={}, budgets={}, freeze_commit=None, premerge=None, sessions=[],
+              next="crew:start skill (recon)", created=today())
+    save(root, st)
+    (fdir(root, name) / "FEATURE.md").write_text(
+        f"# {name}{' · ' + ticket if ticket else ''}\n\nIntent: {intent or 'TBD'}\n\n## Acceptance\n\n## Decisions\n")
+    return st
+
+def l0(root, st):
+    d = fdir(root, st["feature"])
+    intent = next((x[8:] for x in read(d / "FEATURE.md").splitlines() if x.startswith("Intent: ")), "")
+    return (f"crew: feature {st['feature']}{' · ' + st['ticket'] if st['ticket'] else ''} · phase {st['phase']}"
+            f"{' wave ' + str(st['wave']) if st['phase'] == 'build' else ''}\nintent: {intent}\nnext: {st['next']}\n"
+            f"open ICRs: {sum(i['status'] == 'open' for i in icrs(root, st))} · locked: {len(st['locked'])} · "
+            f"notes: {d}/FEATURE.md · continue with the crew:{SKILL[st['phase']]} skill")
+
+def section(text, title):
+    m = re.search(rf"^##\s+{title}\b.*?(?=^##\s|\Z)", text, re.M | re.S | re.I)
+    return m[0].strip() if m else f"(design.md has no '## {title}' section yet)"
+
+def changed(top, sha):
+    """Files differing from sha, committed or not, plus untracked files."""
+    return git("diff", "--name-only", sha, cwd=top).splitlines() + git("ls-files", "-o", "--exclude-standard", cwd=top).splitlines()
+
+def launch_args(root, st, resume=False, auto=False, extra=()):
+    if resume and st["sessions"]:
+        return ["--resume", st["sessions"][-1], *extra]
+    st["sessions"].append(sid := str(uuid.uuid4()))
+    save(root, st)
+    return ["-n", st["feature"], "--session-id", sid, *(["--permission-mode", "auto"] * auto), *extra,
+            f"crew: continue feature '{st['feature']}' (phase {st['phase']}). Use the crew:{SKILL[st['phase']]} "
+            "skill, work until its gate, then stop and ask me."]
+
+def herdr(*args):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    try: return json.loads(r.stdout).get("result", {}) if r.returncode == 0 else {}
+    except ValueError: return {}
+
+def all_states():
+    roots = os.environ.get("CREW_ROOTS", "~/Projects:~/src:~/Documents").split(":")
+    return [(p.parents[3], json.loads(p.read_text())) for r in roots for pat in ("*", "*/*")
+            for p in Path(r).expanduser().glob(f"{pat}/.crew/features/*/state.json")]
+
+def cmd_claude(a):
+    root = repo_root()
+    if root:
+        init(root)
+        local_settings(git("rev-parse", "--show-toplevel"))
+    st = root and (ctx(a)[2] if a.feature else find(root, branch()) or picker(root))
+    os.execvp("claude", ["claude", *(launch_args(root, st, a.resume, a.auto, a.rest) if st else a.rest)])
+
+def picker(root):
+    if not sys.stdin.isatty(): return None
+    br, fs = branch(), features(root)
+    c = input(f"crew: no feature for branch '{br or 'detached HEAD'}'. [n]ew, [l]ink existing, [p]lain claude? ")
+    if c.strip().lower().startswith("n"):
+        return new_feature(root, input("feature name: "), input("one-line intent: "), br=br)
+    if c.strip().lower().startswith("l") and fs:
+        print("\n".join(f"  {i}. {s['feature']} ({s['phase']})" for i, s in enumerate(fs, 1)))
+        return link(root, fs[int(input("number: ")) - 1], br)
+
+def cmd_start(a):
+    root = repo_root() or die("not in a git repo")
+    print(fdir(root, new_feature(root, a.name, a.intent, a.ticket, a.branch, a.worktree)["feature"]))
+
+def cmd_set(a):
+    root = repo_root() or die("not in a git repo")
+    d = meta(root) if a.atlas else ctx(a)[2]
+    d.update((k, val(v)) for k, _, v in (kv.partition("=") for kv in a.pairs))
+    if a.atlas:
+        (root / ".crew/atlas").mkdir(parents=True, exist_ok=True)
+        (root / ".crew/atlas/meta.json").write_text(dump(d))
+    else:
+        save(root, d)
+
+def cmd_where(a):
+    if a.atlas: return print((repo_root() or die("not in a git repo")) / ".crew/atlas")
+    root, _, st = ctx(a)
+    print(fdir(root, st["feature"]))
+
+def cmd_status(a):
+    root, _, st = ctx(a)
+    d = fdir(root, st["feature"])
+    if a.json or a.level in ("L0", "L3"):
+        return print(dump(st) if a.json else l0(root, st) if a.level == "L0"
+                     else read(d / f"blocks/{a.block}.md") or f"(no blocks/{a.block}.md)")
+    print(section(read(d / "design.md"), {"L1": "Connections", "L2": "Blocks"}[a.level]))
+
+def cmd_brief(a):
+    root, _, st = ctx(a)
+    d, b = fdir(root, st["feature"]), a.block
+    print(f"# crew brief · block {b} · feature {st['feature']} · wave {st['wave']}\n\n"
+          f"{read(d / 'FEATURE.md').split('## Acceptance')[0].strip()}\n\n"
+          f"Owns (edit only these): {', '.join(st['owners'].get(b, [])) or 'see design.md'}\n"
+          f"Budget: {st['budgets'].get(b, '?')} lines of non-test code · at most 2 test functions\n"
+          f"Locked (never edit; run `crew icr --block {b} \"what + why\"` instead): {', '.join(st['locked']) or 'none'}\n"
+          f"Repo commands: {json.dumps(meta(root).get('commands', {}))}\n\n"
+          f"{section(read(d / 'design.md'), 'Conventions')}\n\n{read(d / 'blocks' / f'{b}.md')}")
+
+def cmd_areas(a):
+    root = repo_root() or die("not in a git repo")
+    sha = meta(root).get("sha")
+    out = git("diff", "--name-only", f"{sha}..HEAD", check=False) if sha else None
+    files = (git("ls-files") if out is None else out).splitlines()
+    # ponytail: top-level dirs only; split huge dirs into subdirs if one explorer can't cover them
+    print(json.dumps(sorted({f.split("/")[0] if "/" in f else "." for f in files})))
+
+def cmd_check(a):
+    root, top, st = ctx(a)
+    out = {"commands": {}, "locks": [], "blocks": {}, "deps_changed": []}
+    for k, c in meta(root).get("commands", {}).items():
+        if k != "setup":
+            r = subprocess.run(c, shell=True, cwd=top, capture_output=True, text=True, timeout=1800)
+            out["commands"][k] = {"ok": r.returncode == 0, "tail": (r.stdout + r.stderr)[-1500:]}
+    out["locks"] = [f for g, sha in st["locked"].items() for f in changed(top, sha) if hit(f, [g])]
+    tracked = git("ls-files", cwd=top).splitlines()
+    for b, globs in st["owners"].items():
+        files = [(f, (top / f).read_text(errors="ignore")) for f in tracked if hit(f, globs) and (top / f).is_file()]
+        tests = [t for f, t in files if "test" in Path(f).name]
+        loc = sum(1 for f, t in files if "test" not in Path(f).name for x in t.splitlines() if x.strip())
+        out["blocks"][b] = {"loc": [st["budgets"].get(b), loc], "test_fns": sum(len(TEST_FN.findall(t)) for t in tests)}
+    if st["freeze_commit"]:
+        out["deps_changed"] = sorted({f for f in changed(top, st["freeze_commit"]) if Path(f).name in DEPS})
+    print(dump(out))
+
+def cmd_icr(a):
+    root, _, st = ctx(a)
+    items, p = icrs(root, st), fdir(root, st["feature"]) / "icrs.jsonl"
+    if a.text:
+        n = sum(i["block"] == a.block for i in items) + 1
+        item = {"id": f"{a.block or 'icr'}-{n}", "block": a.block, "text": a.text, "status": "open"}
+        with open(p, "a") as f:
+            f.write(json.dumps(item) + "\n")
+        return print(item["id"])
+    for i in items:
+        i["status"] = a.close_as if i["id"] == a.close else i["status"]
+        print(f"{i['id']} [{i['status']}] {i['text']}")
+    if a.close:
+        p.write_text("".join(json.dumps(i) + "\n" for i in items))
+
+def cmd_merge_wave(a):
+    root, top, st = ctx(a)
+    if a.undo:
+        if git("status", "--porcelain", "--untracked-files=no", cwd=top): die("working tree not clean")
+        git("reset", "--hard", st["premerge"] or die("nothing to undo"), cwd=top)
+        return print(json.dumps({"ok": True, "reset_to": st["premerge"]}))
+    st["premerge"] = git("rev-parse", "HEAD", cwd=top)       # --undo after a refused merge is then a no-op
+    save(root, st)
+    locked = sorted({f for b in a.branches for f in git("diff", "--name-only", f"HEAD...{b}", cwd=top).splitlines()
+                     if hit(f, st["locked"])})
+    res = {"ok": not locked, "merged": [], "conflicts": [], "locked": locked}
+    for b in [] if locked else a.branches:
+        if git("merge", "--no-ff", "-m", f"crew: merge {b}", b, cwd=top, check=False) is None:
+            git("merge", "--abort", cwd=top, check=False)
+            res.update(ok=False, conflicts=[b])
+            break
+        res["merged"].append(b)
+    print(json.dumps(res))
+    sys.exit(not res["ok"])
+
+def cmd_approve(a):
+    root, top, st = ctx(a)
+    dirty = [x[3:] for x in git("status", "--porcelain", cwd=top).splitlines()]
+    head = git("rev-parse", "HEAD", cwd=top)
+    for g in a.lock:
+        if any(hit(f, [g]) for f in dirty): die(f"commit the files matching '{g}' before locking them")
+        st["locked"][g] = head
+    st["gates"][a.gate] = today()
+    if a.gate == "freeze":
+        st["freeze_commit"], st["wave"] = head, st["wave"] or 1      # re-freeze after an ICR keeps the wave
+    st["wave"] += a.gate == "wave"
+    st["phase"], st["next"] = GATES[a.gate], a.next or f"crew:{SKILL[GATES[a.gate]]} skill"
+    save(root, st)
+    print(l0(root, st))
+
+def cmd_unlock(a):
+    root, _, st = ctx(a)
+    for g in a.globs: st["locked"].pop(g, None)
+    save(root, st)
+
+def cmd_ls(a):
+    agents = herdr("agent", "list").get("agents", []) if os.environ.get("HERDR_ENV") == "1" else []
+    rows = [(next((g.get("agent_status", "?") for g in agents if g.get("name") == s["feature"]
+                   or g.get("cwd") in (str(r), s["worktree"])), "-"), r, s) for r, s in all_states()]
+    print(f"{'FEATURE':<22}{'REPO':<20}{'PHASE':<9}{'HERDR':<9}NEXT")
+    for h, r, s in sorted(rows, key=lambda x: (x[0] != "blocked", x[2]["phase"] == "done")):
+        print(f"{s['feature']:<22}{r.name:<20}{s['phase']:<9}{h:<9}{s['next']}")
+
+def cmd_go(a):
+    states = all_states()
+    hits = [x for x in states if x[1]["feature"] == a.name] or [x for x in states if a.name in x[1]["feature"]]
+    if len(hits) != 1: die(f"{len(hits)} features match '{a.name}': " + ", ".join(s["feature"] for _, s in hits))
+    root, st = hits[0]
+    path = Path(st["worktree"] or root)
+    if not st["worktree"] and branch(path) not in st["branches"]:
+        git("switch", st["branches"][-1], cwd=path)
+    args = launch_args(root, st, a.resume, a.auto)
+    rp = herdr("tab", "create", "--cwd", str(path), "--label", st["feature"], "--focus").get("root_pane") \
+        if os.environ.get("HERDR_ENV") == "1" else None
+    if pane := rp.get("pane_id") if isinstance(rp, dict) else rp:
+        sys.exit(subprocess.run(["herdr", "agent", "start", st["feature"], "--kind", "claude", "--pane", pane, "--", *args]).returncode)
+    os.chdir(path)
+    os.execvp("claude", ["claude", *args])
+
+def cmd_hook(a):
+    """Hooks must never break a session: any error means 'no opinion'."""
+    try:
+        data = json.load(sys.stdin)
+        cwd = data.get("cwd") or "."
+        if a.kind == "session":
+            if (root := repo_root(cwd)) and (root / ".crew").exists():
+                st = find(root, branch(cwd))
+                print(l0(root, st) if st else f"crew: no feature for branch '{branch(cwd)}'. "
+                      "Start one with the crew:start skill or `crew start NAME`.")
+            return
+        ti = data.get("tool_input", {})
+        p = Path(cwd, ti.get("file_path") or ti.get("notebook_path") or "")
+        d = next(x for x in p.parents if x.exists())
+        rel = p.resolve().relative_to(Path(git("rev-parse", "--show-toplevel", cwd=d)).resolve()).as_posix()
+        if hit(rel, {g for s in features(repo_root(d)) if s["phase"] != "done" for g in s["locked"]}):
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": f"crew: {rel} is locked. Do not edit it. Run "
+                                            "`crew icr --block <your block> \"what you need + why\"` and carry on."}}))
+    except Exception: return
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-f", "--feature", help="feature name (default: found from the current branch)")
+    p = argparse.ArgumentParser(prog="crew", parents=[common], description="Run `crew` with no command to launch claude.")
+    sub = p.add_subparsers(dest="cmd")
+    flag = {"action": "store_true"}
+    for name, fn, *args in [
+        ("claude", cmd_claude, ("--resume", flag), ("--auto", flag)),
+        ("start", cmd_start, ("name", {}), ("--intent", {}), ("--ticket", {}), ("--branch", {}), ("--worktree", flag)),
+        ("set", cmd_set, ("pairs", {"nargs": "+"}), ("--atlas", flag)),
+        ("where", cmd_where, ("--atlas", flag)),
+        ("status", cmd_status, ("level", {"nargs": "?", "default": "L0", "type": str.upper,
+                                          "choices": ["L0", "L1", "L2", "L3"]}), ("block", {"nargs": "?"}), ("--json", flag)),
+        ("brief", cmd_brief, ("block", {})),
+        ("areas", cmd_areas),
+        ("check", cmd_check),
+        ("icr", cmd_icr, ("text", {"nargs": "?"}), ("--block", {}), ("--close", {}),
+         ("--as", {"dest": "close_as", "choices": ["accepted", "rejected"], "default": "accepted"})),
+        ("merge-wave", cmd_merge_wave, ("branches", {"nargs": "*"}), ("--undo", flag)),
+        ("approve", cmd_approve, ("gate", {"choices": list(GATES)}), ("--lock", {"action": "append", "default": []}),
+         ("--next", {})),
+        ("unlock", cmd_unlock, ("globs", {"nargs": "+"})),
+        ("ls", cmd_ls),
+        ("go", cmd_go, ("name", {}), ("--resume", flag), ("--auto", flag)),
+        ("hook", cmd_hook, ("kind", {"choices": ["session", "guard"]})),
+    ]:
+        s = sub.add_parser(name, parents=[common])
+        s.set_defaults(fn=fn)
+        for flag_name, opts in args:
+            s.add_argument(flag_name, **opts)
+    argv = sys.argv[1:]
+    if not argv or argv[0] not in sub.choices and argv[0] not in ("-h", "--help"):
+        argv = ["claude", *argv]
+    a, a.rest = p.parse_known_args(argv)
+    if a.rest and a.cmd != "claude": p.error(f"unrecognized arguments: {' '.join(a.rest)}")
+    a.fn(a)
+
+if __name__ == "__main__":
+    main()

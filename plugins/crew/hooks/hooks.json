@@ -1,0 +1,20 @@
+{
+  "description": "crew: brief every session with its feature's state; refuse edits to locked files",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/crew", "args": ["hook", "session"], "timeout": 10 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/crew", "args": ["hook", "guard"], "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

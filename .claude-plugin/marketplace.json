@@ -1,0 +1,12 @@
+{
+  "name": "crew",
+  "description": "Interface-first, per-branch feature workflow for Claude Code",
+  "owner": { "name": "Ryan Benney" },
+  "plugins": [
+    {
+      "name": "crew",
+      "source": "./plugins/crew",
+      "description": "Run a feature like an engineering team: gates for you, parallel agents between them"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "crew",
+  "version": "0.1.0",
+  "description": "Interface-first, per-branch feature workflow: you approve gates, agents research, build and trim between them",
+  "author": { "name": "Ryan Benney" }
+}
