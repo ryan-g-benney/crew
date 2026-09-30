@@ -2,84 +2,145 @@
 
 Run a feature in Claude Code like an engineering team. You approve the intent, the connections and the
 interfaces; agents read the codebase, research, build in parallel and trim between your gates. State is
-kept per branch, so any new session picks up where the last one stopped.
+kept per repo and branch, so you can leave any feature and pick it up later, in a fresh session, from any
+terminal.
 
-- **`crew`** is a small shell command (Python 3 stdlib, no LLM). It wraps `claude`, maps your branch to a
-  feature, owns phases and file locks, builds agent briefs, runs the checks that need no LLM, and merges
-  build waves.
-- **The `crew` Claude Code plugin** holds the parts that need judgement: a skill per phase, nine agent
-  roles, and four workflows that fan agents out.
+## Set up
 
-## Install
+**The easy way:** open Claude Code anywhere and paste:
 
-Needs `git`, `python3` and `claude` (Claude Code 2.1.283 or newer for dynamic workflows). herdr is optional.
+```
+Set up crew for me from https://github.com/ryan-g-benney/crew. Clone it and follow the
+"Instructions for Claude: setup" section of its README.
+```
+
+**By hand:** needs `git`, `python3` (3.8+) and Claude Code with dynamic workflows (`/workflows` exists;
+built on 2.1.283). herdr is optional.
 
 ```bash
 git clone https://github.com/ryan-g-benney/crew ~/Projects/crew
 ~/Projects/crew/install.sh
 ```
 
-`install.sh` registers this clone as a plugin marketplace (`claude plugin marketplace add`), installs
-`crew@crew`, and links `plugins/crew/bin/crew` to `~/.local/bin/crew`. Because the plugin is installed
-from the local clone, `git pull` updates both the command and the plugin; run `/reload-plugins` in open
-sessions.
+Then restart Claude Code (plugins and hooks load when a session starts).
 
-Nothing is committed to your projects. The first `crew` run in a repo creates `.crew/` (feature state)
-and adds it, plus `.claude/settings.local.json`, to `.git/info/exclude`.
+### Instructions for Claude: setup
 
-## Use
+Follow these steps in order and report the result of each. Ask the user before changing any file outside
+the crew clone (shell rc files, `~/.claude/settings.json`).
+
+1. Check prerequisites: `git --version`, `python3 --version` (need 3.8 or newer), `claude --version`.
+   Stop and tell the user if any is missing.
+2. Get the code. If `~/Projects/crew` exists, run `git -C ~/Projects/crew pull`; otherwise
+   `git clone https://github.com/ryan-g-benney/crew ~/Projects/crew`. Use another path if the user asks.
+3. Run `~/Projects/crew/install.sh`. It is safe to re-run; "already installed" messages are fine. It
+   registers the clone as a plugin marketplace, installs the `crew@crew` plugin, and links the `crew`
+   command into `~/.local/bin`.
+4. Verify:
+   - `claude plugin list` shows `crew@crew` as enabled
+   - `command -v crew` prints a path. If it doesn't, `~/.local/bin` is not on PATH: offer to add
+     `export PATH="$HOME/.local/bin:$PATH"` to the user's shell rc file
+   - `python3 ~/Projects/crew/tests/test_crew.py` prints `ok`
+5. Offer, and only apply if the user agrees: add `"Bash(crew:*)"` to `permissions.allow` in
+   `~/.claude/settings.json`, so agents can call `crew` without a permission prompt each time.
+6. If the user keeps repos somewhere other than `~/Projects`, `~/src` or `~/Documents`, tell them to set
+   `CREW_ROOTS` (colon-separated) in their shell rc so `crew ls` and `crew go` can find them.
+7. Tell the user to restart Claude Code, then start a feature with `cd <repo> && git switch -c <branch> && crew`.
+
+## What you are installing (it's more than a skill)
+
+One install gives you four pieces that work together:
+
+| Piece | How you use it | What it does |
+|---|---|---|
+| `crew` command | you type it in a terminal, instead of `claude` | finds the feature for your repo and branch, launches Claude with a kickoff prompt, lists and opens features across projects. Agents also call it to read and change state. |
+| Skills (`/crew:start` … `/crew:verify`) | Claude picks the right one from the kickoff prompt; you rarely type them | the playbook for each phase, ending at a gate where Claude stops and asks you |
+| Agents and workflows | Claude launches them; watch them in `/workflows` | the "team": explorers, critics, researchers, builders in their own worktrees, a judge, a simplifier, reviewers |
+| Hooks | automatic | brief every new session with the feature's phase and next step; refuse edits to locked files |
+
+So the skill is only the playbook. The `crew` command and the hooks carry state between sessions, which
+is what makes resuming and switching projects work.
+
+## Using it
+
+### Start a feature
 
 ```bash
 cd ~/Projects/some-repo
-git switch -c feat/API-142-rate-limit
-crew                        # no feature for this branch yet: pick [n]ew, give a name and intent
+git switch -c feat/API-142-rate-limit     # a ticket key in the branch name is picked up automatically
+crew                                      # no feature for this branch yet: pick [n]ew, give a name + intent
 ```
 
-Claude starts with a kickoff prompt and works until the next gate, then asks you. Answer in the chat.
+Claude starts and works through the phases. At each gate it stops and asks you; answer in the chat.
 
-| Phase | Skill | What happens | Your gate |
-|---|---|---|---|
-| start | `/crew:start` | recon workflow maps the repo (atlas + reusable inventory) and this feature's slice | approve the slice |
-| scope | `/crew:scope` | acceptance cases with you, critic review, failing harness | approve + lock the harness |
-| design | `/crew:design` | domain model, connections, blocks; researchers, critic; stubs + skeleton workflow | freeze the interfaces |
-| build | `/crew:build` | wave workflow: builders in worktrees, merge, judge, simplifier | next wave / ICRs / verify |
-| verify | `/crew:verify` | review workflow: correctness, security, mutation testing | approve the merge |
+| Phase | What happens | Your gate |
+|---|---|---|
+| start | recon maps the repo (atlas + inventory of reusable code) and this feature's slice of it | approve the slice |
+| scope | acceptance cases with you, a critic's review, a failing test harness | approve and lock the harness |
+| design | domain model, connections, blocks; researchers and a critic; interface stubs and a walking skeleton | freeze the interfaces |
+| build | one wave at a time: builders in worktrees, merge, judge, simplifier | next wave, handle interface change requests, or move to verify |
+| verify | correctness and security reviews, mutation testing, PR description | approve the merge |
 
-Coming back later, from any terminal:
+### Pick up where you left off
+
+| Situation | Do this |
+|---|---|
+| Same repo, same branch | `crew`: a fresh session that starts from a short brief (cheaper than reloading the old chat) |
+| You want the exact previous conversation | `crew --resume` |
+| A different project | `crew ls` to see every feature in every repo, then `crew go <name>`: it goes to that repo, checks out the feature's branch (or its worktree) and launches Claude |
+| You opened plain `claude` in the repo | the session-start hook still prints the brief; say "continue" |
+| After `/clear` or a compaction | the hook briefs the session again |
+| You switched branches mid-session | run `/crew:status` (or `crew status`): it looks up the branch again |
+| You want fewer permission prompts | `crew --auto` starts Claude in auto permission mode |
+
+`crew go` switches branches in the repo's main checkout, so it stops if that checkout has uncommitted
+changes. To avoid that, and to run several features at once, give a feature its own worktree when you
+create it: `crew start <name> --worktree`. Inside herdr, `crew go` opens each feature in a new tab, and
+`crew ls` shows which sessions are working, blocked (waiting for you) or done.
+
+### Check progress at any depth
 
 ```bash
-crew                        # in the repo, on the feature's branch: resumes it (fresh session + brief)
-crew --resume               # reopen the exact last conversation instead
-crew --auto                 # same, in auto permission mode
-crew ls                     # every feature under CREW_ROOTS, blocked ones first (herdr state if inside herdr)
-crew go rate-limit          # open that feature (a new herdr tab when inside herdr)
-crew status L2              # zoom: L0 intent · L1 connections · L2 blocks · L3 <block>
+crew status          # L0: intent, phase, next step, open interface change requests
+crew status L1       # connections: data sources and services, how they fail, what fakes them
+crew status L2       # blocks: who owns what, interfaces, budgets, waves
+crew status L3 <block>
 ```
 
-`CREW_ROOTS` defaults to `~/Projects:~/src:~/Documents`. `crew start NAME --worktree` gives a feature its
-own worktree next to the repo, so several features can run at once in separate herdr tabs.
+The same levels are available inside a session with `/crew:status L2`.
+
+## Where things live
+
+- **In your project, committed as normal code:** the acceptance harness, interface stubs, fakes, tests and
+  the feature code, on the feature branch.
+- **In your project, never committed:** `.crew/` (feature state, design notes, the repo atlas) and
+  `.claude/settings.local.json`. crew adds both to `.git/info/exclude`, so your `.gitignore` is untouched.
+- These notes are local to the machine. On another machine the committed code comes with the branch, but
+  the `.crew/` notes do not.
 
 ## How it stays honest
 
 - **Locks.** Approving the harness and the freeze locks those files. The PreToolUse hook refuses edits,
   `crew check` catches changes made any other way, and `crew merge-wave` refuses branches that touch them.
-  A builder that needs a locked change files an ICR (`crew icr`) for you to decide.
+  A builder that needs a locked change files an interface change request (`crew icr`) for you to decide.
 - **Budgets.** Each block has a line budget and at most two test functions. The judge reports actual vs
   budget; the simplifier then shrinks each green block toward 65% with tests locked, and is rolled back if
   anything turns red.
-- **Worktrees.** Builders each work in their own git worktree (Claude Code's `isolation: "worktree"`),
-  based on the feature branch because crew sets `worktree.baseRef: "head"`.
+- **Worktrees.** Builders each work in their own git worktree, based on the feature branch because crew
+  sets `worktree.baseRef: "head"`.
 
 ## Commands
 
 ```
 crew [claude] [--resume] [--auto]   launch claude for this branch's feature
+crew ls                             every feature under CREW_ROOTS (default ~/Projects:~/src:~/Documents)
+crew go NAME [--resume] [--auto]    open a feature from anywhere
 crew start NAME [--intent] [--ticket] [--branch] [--worktree]
 crew status [L0|L1|L2|L3 BLOCK] [--json]      crew where [--atlas]
 crew set KEY=VALUE... [--atlas]               crew areas
 crew brief BLOCK      crew check      crew icr [TEXT --block B | --close ID --as accepted|rejected]
 crew merge-wave BRANCH... | --undo            crew approve slice|harness|freeze|wave|merge [--lock GLOB]...
-crew unlock GLOB...   crew ls   crew go NAME   crew hook session|guard
+crew unlock GLOB...   crew hook session|guard
 ```
 
 Every command takes `-f FEATURE` (after the command) to skip branch discovery.
@@ -97,8 +158,11 @@ plugins/crew/
 tests/test_crew.py                   python3 tests/test_crew.py
 ```
 
-## Uninstall
+## Update and uninstall
 
 ```bash
-claude plugin marketplace remove crew && rm ~/.local/bin/crew
+git -C ~/Projects/crew pull                                    # updates the command and the plugin
+claude plugin marketplace remove crew && rm ~/.local/bin/crew  # uninstall
 ```
+
+In open sessions, run `/reload-plugins` after an update.
