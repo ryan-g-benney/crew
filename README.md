@@ -113,8 +113,10 @@ The same levels are available inside a session with `/crew:status L2`.
 
 - **In your project, committed as normal code:** the acceptance harness, interface stubs, fakes, tests and
   the feature code, on the feature branch.
-- **In your project, never committed:** `.crew/` (feature state, design notes, the repo atlas) and
-  `.claude/settings.local.json`. crew adds both to `.git/info/exclude`, so your `.gitignore` is untouched.
+- **In your project, never committed:** `.crew/` (feature state, design notes, the repo atlas),
+  `.claude/settings.local.json`, and `.claude/worktrees/` (where builder agents work). crew adds all three to
+  `.git/info/exclude`, git's per-clone ignore file, so they never reach a commit and your `.gitignore` is
+  untouched. crew never runs `git push`; you push the feature branch yourself.
 - These notes are local to the machine. On another machine the committed code comes with the branch, but
   the `.crew/` notes do not.
 

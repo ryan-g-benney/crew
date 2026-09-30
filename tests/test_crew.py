@@ -41,7 +41,7 @@ def test_discovery_state_and_gates():
     repo = new_repo()
     st = json.loads(crew(repo, "status", "--json"))
     assert (st["ticket"], st["phase"], st["branches"]) == ("API-7", "start", ["feat/API-7-limits"])
-    assert ".crew/" in (repo / ".git/info/exclude").read_text()
+    assert {".crew/", ".claude/worktrees/"} <= set((repo / ".git/info/exclude").read_text().split())
     assert json.loads((repo / ".claude/settings.local.json").read_text())["worktree"]["baseRef"] == "head"
     sh(repo, "git", "switch", "-qc", "feat/API-7-limits-v2")          # renamed branch: found via ticket, then linked
     assert json.loads(crew(repo, "status", "--json"))["branches"][-1] == "feat/API-7-limits-v2"

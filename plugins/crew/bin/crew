@@ -76,7 +76,7 @@ def init(root):
     ex = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=root)) / "info/exclude"
     ex.parent.mkdir(exist_ok=True)
     have = read(ex).splitlines()
-    if add := [x for x in (".crew/", ".claude/settings.local.json") if x not in have]:
+    if add := [x for x in (".crew/", ".claude/settings.local.json", ".claude/worktrees/") if x not in have]:
         ex.write_text("\n".join(have + add) + "\n")
     local_settings(root)
 
