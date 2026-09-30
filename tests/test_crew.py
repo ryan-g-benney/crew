@@ -33,14 +33,14 @@ def new_repo():
     sh(repo, "git", "init", "-qb", "main")
     commit(repo, "README.md", "x\n")
     sh(repo, "git", "switch", "-qc", "feat/API-7-limits")
-    crew(repo, "start", "limits", "--intent", "rate limit keys")
+    crew(repo, "start", "Rate limits", "--name", "limits", "--intent", "rate limit keys")
     return repo
 
 
 def test_discovery_state_and_gates():
     repo = new_repo()
     st = json.loads(crew(repo, "status", "--json"))
-    assert (st["ticket"], st["phase"], st["branches"]) == ("API-7", "start", ["feat/API-7-limits"])
+    assert (st["title"], st["ticket"], st["phase"], st["branches"]) == ("Rate limits", "API-7", "start", ["feat/API-7-limits"])
     assert {".crew/", ".claude/worktrees/"} <= set((repo / ".git/info/exclude").read_text().split())
     assert json.loads((repo / ".claude/settings.local.json").read_text())["worktree"]["baseRef"] == "head"
     sh(repo, "git", "switch", "-qc", "feat/API-7-limits-v2")          # renamed branch: found via ticket, then linked
@@ -48,6 +48,14 @@ def test_discovery_state_and_gates():
     assert "phase start" in crew(repo, "hook", "session", stdin=json.dumps({"cwd": str(repo)}))
     assert "phase scope" in crew(repo, "approve", "slice")
     assert "limits-1" == crew(repo, "icr", "need tenant id", "--block", "limits").strip()
+    for i in range(21):                                                 # the log stays short: oldest lines archived
+        crew(repo, "note", f"gate {i}")
+    d = Path(crew(repo, "where").strip())
+    assert (d / "FEATURE.md").read_text().count("\n- ") == 12 and (d / "history.md").read_text().count("gate") == 9
+    assert "gate 20" in crew(repo, "hook", "session", stdin=json.dumps({"cwd": str(repo)}))
+    crew(repo, "split", "limits", "limits-core=src/core*.py:60:pure rate maths", "limits-io=src/io*.py:40")
+    assert sorted(json.loads(crew(repo, "status", "--json"))["owners"]) == ["limits-core", "limits-io"]
+    assert "pure rate maths" in crew(repo, "brief", "limits-core")
 
 
 def test_locks_guard_check_merge():

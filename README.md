@@ -68,10 +68,11 @@ is what makes resuming and switching projects work.
 ```bash
 cd ~/Projects/some-repo
 git switch -c feat/API-142-rate-limit     # a ticket key in the branch name is picked up automatically
-crew                                      # no feature for this branch yet: pick [n]ew, give a name + intent
+crew                                      # new work: asks for a title and a one-line intent
 ```
 
-Claude starts and works through the phases. At each gate it stops and asks you; answer in the chat.
+Started on `main` (or with no branch), new work gets its own worktree and `feat/<name>` branch next to the
+repo, so your main checkout is never touched. Claude starts and works through the phases. At each gate it stops and asks you; answer in the chat.
 
 | Phase | What happens | Your gate |
 |---|---|---|
@@ -85,9 +86,11 @@ Claude starts and works through the phases. At each gate it stops and asks you; 
 
 | Situation | Do this |
 |---|---|
+| Choose what to work on in this repo | `crew -c` (or `crew --continue`): lists every feature with its title, and its recent sessions with Claude's own title for each |
 | Same repo, same branch | `crew`: a fresh session that starts from a short brief (cheaper than reloading the old chat) |
-| You want the exact previous conversation | `crew --resume` |
-| A different project | `crew ls` to see every feature in every repo, then `crew go <name>`: it goes to that repo, checks out the feature's branch (or its worktree) and launches Claude |
+| You want the exact previous conversation | `crew --resume`, or pick it in `crew -c` |
+| A different project | `crew go` with no name: the same picker across every repo. `crew go <name>` jumps straight there |
+| See everything at once | `crew ls`: every feature in every repo, blocked ones first |
 | You opened plain `claude` in the repo | the session-start hook still prints the brief; say "continue" |
 | After `/clear` or a compaction | the hook briefs the session again |
 | You switched branches mid-session | run `/crew:status` (or `crew status`): it looks up the branch again |
@@ -95,8 +98,19 @@ Claude starts and works through the phases. At each gate it stops and asks you; 
 
 `crew go` switches branches in the repo's main checkout, so it stops if that checkout has uncommitted
 changes. To avoid that, and to run several features at once, give a feature its own worktree when you
-create it: `crew start <name> --worktree`. Inside herdr, `crew go` opens each feature in a new tab, and
+create it: `crew start "<title>" --worktree`. Inside herdr, `crew go` opens each feature in a new tab, and
 `crew ls` shows which sessions are working, blocked (waiting for you) or done.
+
+The picker looks like this. Type `1` for a fresh session on that feature or `1a` to resume that session:
+
+```
+  1  Per-key rate limiting  [per-key-rate-limiting · build · llm_endpoint:feat/API-142-rate-limit]
+     1a  09-30 11:07  build   Wave 2 triage and the tenant_id ICR
+     1b  09-29 16:40  design  Designing limiter blocks
+  2  SSE streaming  [sse-streaming · scope · llm_endpoint:feat/sse-streaming]
+    n  new work (asks for a title)
+    p  plain claude
+```
 
 ### Check progress at any depth
 
@@ -108,6 +122,25 @@ crew status L3 <block>
 ```
 
 The same levels are available inside a session with `/crew:status L2`.
+
+## Long features and big repos
+
+crew is built to run for days on large codebases without its context growing:
+
+- **Every phase starts small.** A new session loads only the brief: title, phase, next step, the last three
+  log lines and open change requests. At each gate Claude records one line with `crew note` and offers
+  `/clear`; the brief reloads from `.crew/`, so nothing is lost. The log keeps its newest 12 lines, and older
+  ones move to `history.md`.
+- **Agents get paths, not transcripts.** Each agent starts from its role file and `crew brief <block>`: its
+  intent, owned files, budget, locks and conventions. Workflow agents return short JSON; the full detail
+  stays in the workflow run, not in your session.
+- **Disk is the memory for the repo map.** Each recon explorer writes `atlas/areas/<area>.md` and returns one
+  line. Recon only re-maps areas that changed since the last run, and top-level folders with more than 300
+  files are split into their subfolders so no explorer gets too much.
+- **Big blocks split themselves.** A builder whose block is over ~150 lines, or does more than one thing,
+  splits it into parts (`crew split`) instead of building it. The build workflow sends each part through
+  the same build step in parallel, up to two levels deep, then merges, judges and simplifies the leaves.
+- **Cheap models where judgement isn't needed.** Explorers run on Haiku, merges on Haiku at low effort.
 
 ## Where things live
 
@@ -134,10 +167,12 @@ The same levels are available inside a session with `/crew:status L2`.
 ## Commands
 
 ```
-crew [claude] [--resume] [--auto]   launch claude for this branch's feature
+crew [claude] [-c] [--resume] [--auto]   launch claude for this branch's feature; -c shows the picker
 crew ls                             every feature under CREW_ROOTS (default ~/Projects:~/src:~/Documents)
-crew go NAME [--resume] [--auto]    open a feature from anywhere
-crew start NAME [--intent] [--ticket] [--branch] [--worktree]
+crew go [NAME] [--resume] [--auto]  open a feature from anywhere; no NAME shows the picker
+crew start TITLE [--name] [--intent] [--ticket] [--branch] [--worktree]
+crew note TEXT                      add a dated line to the feature's log
+crew split BLOCK PART=GLOB[,GLOB]:BUDGET[:NOTE]...   replace a block with smaller parts
 crew status [L0|L1|L2|L3 BLOCK] [--json]      crew where [--atlas]
 crew set KEY=VALUE... [--atlas]               crew areas
 crew brief BLOCK      crew check      crew icr [TEXT --block B | --close ID --as accepted|rejected]

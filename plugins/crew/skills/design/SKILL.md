@@ -24,7 +24,8 @@ acceptance case running end to end. Then stop at the freeze gate.
    Rules: every data source and service sits behind a port with a fake. Interfaces exist only at block
    edges and I/O ports, and each has two implementations (real + fake). Pure logic goes in a functional
    core, I/O in thin adapters. Reuse is one of: reuse <INVENTORY item> · extend <item> · local ·
-   shared (shared needs a third use).
+   shared (shared needs a third use). Aim for blocks under ~150 lines; a builder splits anything bigger
+   into parts itself (`crew split`), so size the budget honestly rather than inflating block counts.
 3. Open questions: one `crew:researcher` agent per question, in parallel. A risky unknown: a
    `crew:researcher` in spike mode with `isolation: "worktree"`; keep only its answer.
 4. Ask a `crew:critic` agent in design mode to attack design.md against INVENTORY.md. Apply the cuts the
@@ -42,6 +43,8 @@ acceptance case running end to end. Then stop at the freeze gate.
    - Approved: commit anything left, then `crew approve freeze --lock "<file>"` once per interface, fake
      and contract-test file. Continue with the crew:build skill.
    - Changes: edit design.md and rerun step 6 for the affected blocks.
+   Record it in one line: `crew note "freeze: <decision>; <why>"`. If this session ran a workflow, tell
+   the user they can run `/clear` now: the brief reloads from .crew, so the next phase starts small.
 
 Amending after an accepted ICR (phase was set back to design): change only what the ICR needs in
 design.md and the stub, rerun the block's contract test, commit, then `crew approve freeze --lock <file>`

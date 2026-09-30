@@ -25,6 +25,8 @@ for the right reason. Then stop at the harness gate.
 5. Harness gate. Show the cases and the critic's open points. Ask: "Approve and lock the harness?"
    - Approved: `crew approve harness --lock "<cases glob>" --lock "<runner file>"`, then continue with the
      crew:design skill.
+   Record it in one line: `crew note "harness: <decision>; <why>"`. If this session ran a workflow, tell
+   the user they can run `/clear` now: the brief reloads from .crew, so the next phase starts small.
 
 Expected outputs belong to the user. Once locked they change only through a harness amendment the user
 asks for: `crew unlock <glob>`, edit, commit, `crew approve harness --lock <glob>` again.

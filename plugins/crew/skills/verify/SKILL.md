@@ -13,3 +13,4 @@ description: crew phase "verify" - run correctness and security reviews plus mut
 4. Draft the PR description from FEATURE.md (intent, acceptance cases, decisions) and design.md
    (connections and blocks in a few lines). Put it in your reply for the user to paste.
 5. Merge gate. Ask: "Approve for merge?" Approved: `crew approve merge`. The user opens or merges the PR.
+   Record it: `crew note "merge: approved; <one-line summary of the feature>"`.

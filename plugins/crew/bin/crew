@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """crew: the deterministic half of the crew harness. Branch -> feature state, gates, locks, agent briefs,
 LLM-free checks, wave merges and both hooks. State lives in <main repo>/.crew/ and is never committed."""
-import argparse, datetime, fnmatch, json, os, re, subprocess, sys, uuid
+import argparse, collections, datetime, fnmatch, json, os, re, subprocess, sys, uuid
 from pathlib import Path
 
 TICKET = re.compile(r"[A-Z][A-Z0-9]+-\d+")
@@ -10,11 +10,14 @@ SKILL = {**{p: p for p in ("start", "scope", "design", "build", "verify")}, "don
 DEPS = {"pyproject.toml", "requirements.txt", "uv.lock", "poetry.lock", "package.json", "package-lock.json",
         "pnpm-lock.yaml", "yarn.lock", "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "Gemfile.lock"}
 TEST_FN = re.compile(r"^\s*(?:async\s+)?def test_|^\s*(?:it|test)\(", re.M)
+CLAUDE = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+AREA_MAX, LOG_MAX, LOG_KEEP, SESSIONS_KEEP = 300, 20, 12, 20
 
 def die(msg): sys.exit(f"crew: {msg}")
-def today(): return datetime.date.today().isoformat()
+def now(): return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 def read(p): return p.read_text() if p.exists() else ""
 def dump(o): return json.dumps(o, indent=2) + "\n"
+def slug(s): return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:40].strip("-")
 def fdir(root, name): return root / ".crew" / "features" / name
 def save(root, st): (fdir(root, st["feature"]) / "state.json").write_text(dump(st))
 def meta(root): return json.loads(read(root / ".crew/atlas/meta.json") or "{}")
@@ -22,6 +25,8 @@ def features(root): return [json.loads(p.read_text()) for p in sorted(root.glob(
 def icrs(root, st): return [json.loads(x) for x in read(fdir(root, st["feature"]) / "icrs.jsonl").splitlines() if x]
 def hit(path, globs): return any(fnmatch.fnmatch(path, g) or g.endswith("/") and path.startswith(g) for g in globs)
 def branch(cwd="."): return git("branch", "--show-current", cwd=cwd, check=False) or ""
+def log_lines(text): return [x for x in text.partition("\n## Log\n")[2].splitlines() if x.startswith("- ")]
+def last(st, a): return (sessions(st) or [{}])[-1].get("id") if a.resume else None
 
 def git(*args, cwd=".", check=True):
     r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
@@ -38,18 +43,18 @@ def val(v):
     try: return json.loads(v)
     except ValueError: return v
 
-def link(root, st, br):
-    if br not in st["branches"]:
-        st["branches"].append(br)
-        save(root, st)
-    return st
+def tail(p, n=1 << 18):
+    with open(p, "rb") as f:
+        f.seek(max(0, p.stat().st_size - n))
+        return f.read().decode(errors="ignore")
 
 def find(root, br):
     """Branch -> feature: exact branch match, else a ticket key in the branch name (which links the branch)."""
     fs, key = features(root), TICKET.search(br)
     st = next((s for s in fs if br in s["branches"]), None)
     if not st and key and (st := next((s for s in fs if s.get("ticket") == key[0]), None)):
-        link(root, st, br)
+        st["branches"].append(br)
+        save(root, st)
     return st
 
 def ctx(a):
@@ -58,7 +63,7 @@ def ctx(a):
     if a.feature:
         st = json.loads(read(fdir(root, a.feature) / "state.json") or "null") or die(f"no feature '{a.feature}'")
     else:
-        st = find(root, branch()) or die(f"no crew feature for branch '{branch()}' (crew start NAME)")
+        st = find(root, branch()) or die(f"no crew feature for branch '{branch()}' (crew start TITLE)")
     return root, Path(git("rev-parse", "--show-toplevel")), st
 
 def local_settings(top):
@@ -72,7 +77,7 @@ def local_settings(top):
 
 def init(root):
     (root / ".crew/features").mkdir(parents=True, exist_ok=True)
-    (root / ".crew/atlas").mkdir(exist_ok=True)
+    (root / ".crew/atlas/areas").mkdir(parents=True, exist_ok=True)
     ex = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=root)) / "info/exclude"
     ex.parent.mkdir(exist_ok=True)
     have = read(ex).splitlines()
@@ -80,9 +85,9 @@ def init(root):
         ex.write_text("\n".join(have + add) + "\n")
     local_settings(root)
 
-def new_feature(root, name, intent=None, ticket=None, br=None, worktree=False):
+def new_feature(root, title, intent=None, ticket=None, br=None, worktree=False, name=None):
     init(root)
-    name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or die("empty feature name")
+    name = slug(name or title) or die("a title is needed")
     if fdir(root, name).exists(): die(f"feature '{name}' already exists")
     br = br or (f"feat/{name}" if worktree else branch()) or die("detached HEAD: pass --branch")
     wt = root.parent / f"{root.name}.worktrees" / name if worktree else None
@@ -92,19 +97,22 @@ def new_feature(root, name, intent=None, ticket=None, br=None, worktree=False):
         local_settings(wt)
     ticket = ticket or (TICKET.search(br) or [None])[0]
     fdir(root, name).mkdir(parents=True)
-    st = dict(feature=name, ticket=ticket, branches=[br], worktree=wt and str(wt), phase="start", wave=0,
-              gates={}, locked={}, owners={}, budgets={}, freeze_commit=None, premerge=None, sessions=[],
-              next="crew:start skill (recon)", created=today())
+    st = dict(feature=name, title=title.strip(), ticket=ticket, branches=[br], worktree=wt and str(wt), phase="start",
+              wave=0, gates={}, locked={}, owners={}, budgets={}, parts={}, notes={}, freeze_commit=None,
+              premerge=None, sessions=[], next="crew:start skill (recon)", created=now()[:10])
     save(root, st)
-    (fdir(root, name) / "FEATURE.md").write_text(
-        f"# {name}{' · ' + ticket if ticket else ''}\n\nIntent: {intent or 'TBD'}\n\n## Acceptance\n\n## Decisions\n")
+    (fdir(root, name) / "FEATURE.md").write_text(f"# {st['title']}{' · ' + ticket if ticket else ''}\n\nIntent: "
+                                                 f"{intent or 'TBD'}\n\n## Acceptance\n\n## Decisions\n\n## Log\n")
     return st
 
 def l0(root, st):
     d = fdir(root, st["feature"])
-    intent = next((x[8:] for x in read(d / "FEATURE.md").splitlines() if x.startswith("Intent: ")), "")
-    return (f"crew: feature {st['feature']}{' · ' + st['ticket'] if st['ticket'] else ''} · phase {st['phase']}"
-            f"{' wave ' + str(st['wave']) if st['phase'] == 'build' else ''}\nintent: {intent}\nnext: {st['next']}\n"
+    text = read(d / "FEATURE.md")
+    intent = next((x[8:] for x in text.splitlines() if x.startswith("Intent: ")), "")
+    recent = " | ".join(x[2:] for x in log_lines(text)[-3:])
+    return (f"crew: {st.get('title', st['feature'])} [{st['feature']}{' · ' + st['ticket'] if st['ticket'] else ''}]"
+            f" · phase {st['phase']}{' wave ' + str(st['wave']) if st['phase'] == 'build' else ''}\n"
+            f"intent: {intent}\nnext: {st['next']}\n{'recent: ' + recent + chr(10) if recent else ''}"
             f"open ICRs: {sum(i['status'] == 'open' for i in icrs(root, st))} · locked: {len(st['locked'])} · "
             f"notes: {d}/FEATURE.md · continue with the crew:{SKILL[st['phase']]} skill")
 
@@ -116,12 +124,22 @@ def changed(top, sha):
     """Files differing from sha, committed or not, plus untracked files."""
     return git("diff", "--name-only", sha, cwd=top).splitlines() + git("ls-files", "-o", "--exclude-standard", cwd=top).splitlines()
 
-def launch_args(root, st, resume=False, auto=False, extra=()):
-    if resume and st["sessions"]:
-        return ["--resume", st["sessions"][-1], *extra]
-    st["sessions"].append(sid := str(uuid.uuid4()))
+def sessions(st):
+    """Sessions that have a transcript, oldest first, titled with Claude's own aiTitle when it has one."""
+    out = []
+    for s in st["sessions"]:
+        s = s if isinstance(s, dict) else {"id": s, "phase": "?"}
+        if f := next(CLAUDE.glob(f"projects/*/{s['id']}.jsonl"), None):
+            titles = re.findall(r'"aiTitle":\s*("(?:[^"\\]|\\.)*")', tail(f))
+            out.append({**s, "title": json.loads(titles[-1]) if titles else s.get("label", ""),
+                        "when": datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M")})
+    return out
+
+def fresh_args(root, st, auto, extra):
+    s = {"id": str(uuid.uuid4()), "phase": st["phase"], "label": f"{st.get('title', st['feature'])} · {st['phase']}"}
+    st["sessions"] = st["sessions"][1 - SESSIONS_KEEP:] + [s]
     save(root, st)
-    return ["-n", st["feature"], "--session-id", sid, *(["--permission-mode", "auto"] * auto), *extra,
+    return ["-n", s["label"], "--session-id", s["id"], *(["--permission-mode", "auto"] * auto), *extra,
             f"crew: continue feature '{st['feature']}' (phase {st['phase']}). Use the crew:{SKILL[st['phase']]} "
             "skill, work until its gate, then stop and ask me."]
 
@@ -130,32 +148,56 @@ def herdr(*args):
     try: return json.loads(r.stdout).get("result", {}) if r.returncode == 0 else {}
     except ValueError: return {}
 
-def all_states():
-    roots = os.environ.get("CREW_ROOTS", "~/Projects:~/src:~/Documents").split(":")
-    return [(p.parents[3], json.loads(p.read_text())) for r in roots for pat in ("*", "*/*")
-            for p in Path(r).expanduser().glob(f"{pat}/.crew/features/*/state.json")]
+def launch(root, st, a, sid=None, tab=False):
+    """Go to the feature's checkout (switching branch if needed) and start or resume claude there."""
+    path = Path(st["worktree"] or root)
+    if not st["worktree"] and branch(path) not in st["branches"]:
+        git("switch", st["branches"][-1], cwd=path)
+    args = ["--resume", sid, *(["--permission-mode", "auto"] * a.auto), *a.rest] if sid else fresh_args(root, st, a.auto, a.rest)
+    if tab and os.environ.get("HERDR_ENV") == "1":
+        rp = herdr("tab", "create", "--cwd", str(path), "--label", st["feature"], "--focus").get("root_pane")
+        if pane := rp.get("pane_id") if isinstance(rp, dict) else rp:
+            sys.exit(subprocess.run(["herdr", "agent", "start", st["feature"], "--kind", "claude", "--pane", pane, "--", *args]).returncode)
+    os.chdir(path)
+    os.execvp("claude", ["claude", *args])
+
+def menu(entries, new):
+    """Numbered picker: '1' starts a fresh session on feature 1, '1a' resumes its newest session."""
+    if not sys.stdin.isatty(): return None
+    opts = {}
+    for i, (root, st) in enumerate(entries, 1):
+        print(f"{i:>3}  {st.get('title', st['feature'])}  [{st['feature']} · {st['phase']} · {root.name}:{st['branches'][-1]}]")
+        opts[str(i)] = (root, st, None)
+        for k, s in zip("abcde", sessions(st)[::-1]):
+            print(f"     {i}{k}  {s['when']}  {s['phase']:<7} {s['title']}")
+            opts[f"{i}{k}"] = (root, st, s["id"])
+    print(("    n  new work (asks for a title)\n" if new else "") + "    p  plain claude")
+    c = input("choose (1 = fresh session, 1a = resume that session): ").strip().lower()
+    return "new" if new and c == "n" else opts.get(c)
+
+def ask_new(root):
+    """New work: ask for a title. On main/master/detached it gets its own worktree and feat/<name> branch."""
+    title = input("title for this work: ").strip() or die("a title is needed")
+    intent, br = input("one-line intent (optional): ").strip() or None, branch()
+    on_main = br in ("", "main", "master")
+    return new_feature(root, title, intent, br=None if on_main else br, worktree=on_main)
 
 def cmd_claude(a):
     root = repo_root()
-    if root:
-        init(root)
-        local_settings(git("rev-parse", "--show-toplevel"))
-    st = root and (ctx(a)[2] if a.feature else find(root, branch()) or picker(root))
-    os.execvp("claude", ["claude", *(launch_args(root, st, a.resume, a.auto, a.rest) if st else a.rest)])
-
-def picker(root):
-    if not sys.stdin.isatty(): return None
-    br, fs = branch(), features(root)
-    c = input(f"crew: no feature for branch '{br or 'detached HEAD'}'. [n]ew, [l]ink existing, [p]lain claude? ")
-    if c.strip().lower().startswith("n"):
-        return new_feature(root, input("feature name: "), input("one-line intent: "), br=br)
-    if c.strip().lower().startswith("l") and fs:
-        print("\n".join(f"  {i}. {s['feature']} ({s['phase']})" for i, s in enumerate(fs, 1)))
-        return link(root, fs[int(input("number: ")) - 1], br)
+    if not root: os.execvp("claude", ["claude", *a.rest])
+    init(root)
+    local_settings(git("rev-parse", "--show-toplevel"))
+    st = ctx(a)[2] if a.feature else find(root, branch())
+    if st and not a.cont:
+        launch(root, st, a, last(st, a))
+    c = menu([(root, s) for s in features(root)], new=True)
+    if c:
+        launch(root, ask_new(root), a) if c == "new" else launch(c[0], c[1], a, c[2])
+    os.execvp("claude", ["claude", *a.rest])
 
 def cmd_start(a):
     root = repo_root() or die("not in a git repo")
-    print(fdir(root, new_feature(root, a.name, a.intent, a.ticket, a.branch, a.worktree)["feature"]))
+    print(fdir(root, new_feature(root, a.title, a.intent, a.ticket, a.branch, a.worktree, a.name)["feature"]))
 
 def cmd_set(a):
     root = repo_root() or die("not in a git repo")
@@ -183,21 +225,26 @@ def cmd_status(a):
 def cmd_brief(a):
     root, _, st = ctx(a)
     d, b = fdir(root, st["feature"]), a.block
-    print(f"# crew brief · block {b} · feature {st['feature']} · wave {st['wave']}\n\n"
+    parent = st.get("parts", {}).get(b, "")
+    print(f"# crew brief · block {b}{' (part of ' + parent + ')' if parent else ''} · feature {st['feature']} · wave {st['wave']}\n\n"
           f"{read(d / 'FEATURE.md').split('## Acceptance')[0].strip()}\n\n"
           f"Owns (edit only these): {', '.join(st['owners'].get(b, [])) or 'see design.md'}\n"
           f"Budget: {st['budgets'].get(b, '?')} lines of non-test code · at most 2 test functions\n"
           f"Locked (never edit; run `crew icr --block {b} \"what + why\"` instead): {', '.join(st['locked']) or 'none'}\n"
           f"Repo commands: {json.dumps(meta(root).get('commands', {}))}\n\n"
-          f"{section(read(d / 'design.md'), 'Conventions')}\n\n{read(d / 'blocks' / f'{b}.md')}")
+          f"{section(read(d / 'design.md'), 'Conventions')}\n\n{st.get('notes', {}).get(b, '')}\n\n"
+          f"{read(d / 'blocks' / f'{b}.md') or (parent and read(d / 'blocks' / f'{parent}.md'))}")
 
 def cmd_areas(a):
     root = repo_root() or die("not in a git repo")
-    sha = meta(root).get("sha")
+    sha, tracked = meta(root).get("sha"), git("ls-files").splitlines()
     out = git("diff", "--name-only", f"{sha}..HEAD", check=False) if sha else None
-    files = (git("ls-files") if out is None else out).splitlines()
-    # ponytail: top-level dirs only; split huge dirs into subdirs if one explorer can't cover them
-    print(json.dumps(sorted({f.split("/")[0] if "/" in f else "." for f in files})))
+    size = collections.Counter(f.split("/")[0] for f in tracked)
+
+    def area(f):  # ponytail: one level of splitting; recurse if a single subdir is still too big
+        p = f.split("/")
+        return "/".join(p[:2]) if len(p) > 2 and size[p[0]] > AREA_MAX else p[0] if len(p) > 1 else "."
+    print(json.dumps(sorted({area(f) for f in (tracked if out is None else out.splitlines())})))
 
 def cmd_check(a):
     root, top, st = ctx(a)
@@ -216,6 +263,31 @@ def cmd_check(a):
     if st["freeze_commit"]:
         out["deps_changed"] = sorted({f for f in changed(top, st["freeze_commit"]) if Path(f).name in DEPS})
     print(dump(out))
+
+def cmd_split(a):
+    """Replace a block too big for one agent with parts: name=glob[,glob]:budget[:note]."""
+    root, _, st = ctx(a)
+    for spec in a.parts:
+        m = re.fullmatch(r"([\w.-]+)=([^:]+):(\d+)(?::(.*))?", spec, re.S) or die(f"bad part '{spec}': want name=glob[,glob]:budget[:note]")
+        st["owners"][m[1]], st["budgets"][m[1]] = m[2].split(","), int(m[3])
+        st.setdefault("parts", {})[m[1]] = a.block
+        st.setdefault("notes", {})[m[1]] = m[4] or ""
+    st["owners"].pop(a.block, None)
+    st["budgets"].pop(a.block, None)
+    save(root, st)
+    print(" ".join(p.split("=")[0] for p in a.parts))
+
+def cmd_note(a):
+    """Append a dated line to FEATURE.md's Log; the oldest lines move to history.md so the log stays short."""
+    root, _, st = ctx(a)
+    p = fdir(root, st["feature"]) / "FEATURE.md"
+    text = read(p)
+    lines = log_lines(text) + [f"- {now()} {' '.join(a.text.split())}"]
+    if len(lines) > LOG_MAX:
+        with open(p.parent / "history.md", "a") as f:
+            f.write("\n".join(lines[:-LOG_KEEP]) + "\n")
+        lines = lines[-LOG_KEEP:]
+    p.write_text(f"{text.partition(chr(10) + '## Log' + chr(10))[0].rstrip()}\n\n## Log\n" + "\n".join(lines) + "\n")
 
 def cmd_icr(a):
     root, _, st = ctx(a)
@@ -259,7 +331,7 @@ def cmd_approve(a):
     for g in a.lock:
         if any(hit(f, [g]) for f in dirty): die(f"commit the files matching '{g}' before locking them")
         st["locked"][g] = head
-    st["gates"][a.gate] = today()
+    st["gates"][a.gate] = now()[:10]
     if a.gate == "freeze":
         st["freeze_commit"], st["wave"] = head, st["wave"] or 1      # re-freeze after an ICR keeps the wave
     st["wave"] += a.gate == "wave"
@@ -272,29 +344,28 @@ def cmd_unlock(a):
     for g in a.globs: st["locked"].pop(g, None)
     save(root, st)
 
+def all_states():
+    roots = os.environ.get("CREW_ROOTS", "~/Projects:~/src:~/Documents").split(":")
+    return [(p.parents[3], json.loads(p.read_text())) for r in roots for pat in ("*", "*/*")
+            for p in Path(r).expanduser().glob(f"{pat}/.crew/features/*/state.json")]
+
 def cmd_ls(a):
     agents = herdr("agent", "list").get("agents", []) if os.environ.get("HERDR_ENV") == "1" else []
     rows = [(next((g.get("agent_status", "?") for g in agents if g.get("name") == s["feature"]
                    or g.get("cwd") in (str(r), s["worktree"])), "-"), r, s) for r, s in all_states()]
-    print(f"{'FEATURE':<22}{'REPO':<20}{'PHASE':<9}{'HERDR':<9}NEXT")
+    print(f"{'FEATURE':<22}{'REPO':<20}{'PHASE':<9}{'HERDR':<9}TITLE · NEXT")
     for h, r, s in sorted(rows, key=lambda x: (x[0] != "blocked", x[2]["phase"] == "done")):
-        print(f"{s['feature']:<22}{r.name:<20}{s['phase']:<9}{h:<9}{s['next']}")
+        print(f"{s['feature']:<22}{r.name:<20}{s['phase']:<9}{h:<9}{s.get('title', '')} · {s['next']}")
 
 def cmd_go(a):
     states = all_states()
+    if not a.name:
+        c = menu(states, new=False)
+        return c and launch(c[0], c[1], a, c[2], tab=True)
     hits = [x for x in states if x[1]["feature"] == a.name] or [x for x in states if a.name in x[1]["feature"]]
     if len(hits) != 1: die(f"{len(hits)} features match '{a.name}': " + ", ".join(s["feature"] for _, s in hits))
     root, st = hits[0]
-    path = Path(st["worktree"] or root)
-    if not st["worktree"] and branch(path) not in st["branches"]:
-        git("switch", st["branches"][-1], cwd=path)
-    args = launch_args(root, st, a.resume, a.auto)
-    rp = herdr("tab", "create", "--cwd", str(path), "--label", st["feature"], "--focus").get("root_pane") \
-        if os.environ.get("HERDR_ENV") == "1" else None
-    if pane := rp.get("pane_id") if isinstance(rp, dict) else rp:
-        sys.exit(subprocess.run(["herdr", "agent", "start", st["feature"], "--kind", "claude", "--pane", pane, "--", *args]).returncode)
-    os.chdir(path)
-    os.execvp("claude", ["claude", *args])
+    launch(root, st, a, last(st, a), tab=True)
 
 def cmd_hook(a):
     """Hooks must never break a session: any error means 'no opinion'."""
@@ -305,7 +376,7 @@ def cmd_hook(a):
             if (root := repo_root(cwd)) and (root / ".crew").exists():
                 st = find(root, branch(cwd))
                 print(l0(root, st) if st else f"crew: no feature for branch '{branch(cwd)}'. "
-                      "Start one with the crew:start skill or `crew start NAME`.")
+                      "Start one with the crew:start skill or `crew start TITLE`.")
             return
         ti = data.get("tool_input", {})
         p = Path(cwd, ti.get("file_path") or ti.get("notebook_path") or "")
@@ -325,8 +396,9 @@ def main():
     sub = p.add_subparsers(dest="cmd")
     flag = {"action": "store_true"}
     for name, fn, *args in [
-        ("claude", cmd_claude, ("--resume", flag), ("--auto", flag)),
-        ("start", cmd_start, ("name", {}), ("--intent", {}), ("--ticket", {}), ("--branch", {}), ("--worktree", flag)),
+        ("claude", cmd_claude, ("--resume", flag), ("--auto", flag), (("-c", "--continue"), {"dest": "cont", **flag})),
+        ("start", cmd_start, ("title", {}), ("--name", {}), ("--intent", {}), ("--ticket", {}), ("--branch", {}),
+         ("--worktree", flag)),
         ("set", cmd_set, ("pairs", {"nargs": "+"}), ("--atlas", flag)),
         ("where", cmd_where, ("--atlas", flag)),
         ("status", cmd_status, ("level", {"nargs": "?", "default": "L0", "type": str.upper,
@@ -334,6 +406,8 @@ def main():
         ("brief", cmd_brief, ("block", {})),
         ("areas", cmd_areas),
         ("check", cmd_check),
+        ("split", cmd_split, ("block", {}), ("parts", {"nargs": "+"})),
+        ("note", cmd_note, ("text", {})),
         ("icr", cmd_icr, ("text", {"nargs": "?"}), ("--block", {}), ("--close", {}),
          ("--as", {"dest": "close_as", "choices": ["accepted", "rejected"], "default": "accepted"})),
         ("merge-wave", cmd_merge_wave, ("branches", {"nargs": "*"}), ("--undo", flag)),
@@ -341,13 +415,13 @@ def main():
          ("--next", {})),
         ("unlock", cmd_unlock, ("globs", {"nargs": "+"})),
         ("ls", cmd_ls),
-        ("go", cmd_go, ("name", {}), ("--resume", flag), ("--auto", flag)),
+        ("go", cmd_go, ("name", {"nargs": "?"}), ("--resume", flag), ("--auto", flag)),
         ("hook", cmd_hook, ("kind", {"choices": ["session", "guard"]})),
     ]:
         s = sub.add_parser(name, parents=[common])
         s.set_defaults(fn=fn)
-        for flag_name, opts in args:
-            s.add_argument(flag_name, **opts)
+        for names, opts in args:
+            s.add_argument(*(names if isinstance(names, tuple) else (names,)), **opts)
     argv = sys.argv[1:]
     if not argv or argv[0] not in sub.choices and argv[0] not in ("-h", "--help"):
         argv = ["claude", *argv]

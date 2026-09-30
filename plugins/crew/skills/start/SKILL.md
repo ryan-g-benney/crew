@@ -8,8 +8,8 @@ description: crew phase "start" - create or resume the crew feature for this bra
 Goal: know what we are building and which part of the codebase it touches. Then stop at the slice gate.
 Never write feature code in this phase.
 
-1. Run `crew status`. If there is no feature for this branch, ask the user for a short feature name and a
-   one-paragraph intent, then run `crew start <name> --intent "<intent>"` (add `--ticket KEY` if they give one).
+1. Run `crew status`. If there is no feature for this branch, ask the user for a title for this work and a
+   one-paragraph intent, then run `crew start "<title>" --intent "<intent>"` (add `--ticket KEY` if they give one).
    If the intent in FEATURE.md is `TBD`, ask for it and write it there (`crew where` prints the folder).
 2. Recon. Run `crew areas`: the repo areas that changed since the atlas was last built (all areas the first
    time, possibly none). Launch the `crew:recon` workflow (Workflow tool, `name: "crew:recon"`) with
@@ -20,3 +20,5 @@ Never write feature code in this phase.
    repo commands recon recorded. Ask: "Approve this slice?"
    - Approved: run `crew approve slice`, then continue with the crew:scope skill.
    - Wrong area: rerun step 2 with the user's notes appended to the intent.
+   Record it in one line: `crew note "slice: <decision>; <why>"`. If this session ran a workflow, tell
+   the user they can run `/clear` now: the brief reloads from .crew, so the next phase starts small.
